@@ -14,6 +14,25 @@
 
 """Gemma adaptation for Pi, taken from big_vision.
 
+这个文件是 openpi 里最核心的 Transformer 适配层之一。它不是单纯复刻一个普通 Gemma，
+而是把 Gemma 改造成“多 expert 共享 attention”的形式，服务于 `src/openpi/models/pi0.py`。
+
+在 pi0 / pi0.5 里，上游 `Pi0.__init__` 会这样构造它：
+
+    _gemma.Module(configs=[paligemma_config, action_expert_config], ...)
+
+也就是说，`configs[0]` 对应 PaliGemma 语言/视觉前缀 expert，
+`configs[1]` 对应 action expert。`pi0.py` 会把图像和文本编码成 prefix tokens，
+把 noisy action / state / timestep 编码成 suffix tokens，然后交给这个 Module 做统一 Transformer 前向。
+
+读这个文件时要一直记住三个项目级上下文：
+
+1. `embed_prefix()` 产生的是条件信息：图像 token + prompt token。
+2. `embed_suffix()` 产生的是动作生成相关信息：pi0 里有 state token + action tokens；
+   pi0.5 里通常只有 action tokens，timestep 通过 `adarms_cond` 注入。
+3. `sample_actions()` 推理时会先把 prefix 跑一遍得到 KV cache，然后每个 flow step 只跑 suffix，
+   所以本文件里的 `kv_cache` 不是抽象概念，而是 openpi 加速动作采样的关键。
+
 We follow this einsum axis naming convention:
   B: batch
   T: query length
@@ -113,9 +132,25 @@ def get_config(variant: Variant) -> Config:
 class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x, cond):
-        dtype = x.dtype  # dtype: 记住输入原始精度，最后要把输出转回这个 dtype。
-        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # var: RMSNorm 只按最后一维统计均方值，这里用 float32 保证数值更稳。
-        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # 先完成标准 RMS 归一化，不引入 mean-centering。
+        # 输入:
+        # - x: 当前 expert 的 hidden states，通常形状是 [batch, seq_len, width]。
+        #      在 pi0.py 里，x 可能来自 prefix tokens，也可能来自 suffix/action tokens。
+        # - cond: 条件向量，形状通常是 [batch, width] 或 None。
+        #         pi0 中一般是 None；pi0.5 的 action expert 中是 timestep embedding。
+        #
+        # 输出:
+        # - normed_inputs: 和 x 同形状的归一化/调制后 hidden states。
+        # - gate: None 或形状 [batch, 1, width] 的门控向量，会在 `_gated_residual()` 里使用。
+        # RMSNorm 在 openpi 里有两种工作状态：
+        # 1. cond is None: 普通 RMSNorm，用于 pi0，或者 pi0.5 的 prefix/PaliGemma expert。
+        # 2. cond is not None: adaptive RMSNorm，用于 pi0.5 的 action expert。
+        #
+        # 这里的 cond 来自 `pi0.py::embed_suffix()`：
+        # timestep -> posemb_sincos -> time_mlp_in/out -> adarms_cond。
+        # 所以 cond 表示“当前 flow matching 时间 t”，不是语言 prompt，也不是 robot state。
+        dtype = x.dtype  # dtype: x 的原始精度，可能是 bfloat16；最后输出要转回这个 dtype 以匹配主干计算。
+        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # var: 每个 token 自己沿 hidden dim 求均方值，形状是 [batch, seq_len, 1]。
+        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # normed_inputs: RMS 归一化后的 x，形状不变。
         if cond is None:
             # regular RMSNorm
             scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))  # scale: 学习到的逐通道缩放参数，初值是 0，所以实际缩放从 1+scale 开始。
@@ -128,6 +163,9 @@ class RMSNorm(nn.Module):
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)  # modulation: 从条件向量一次性预测出 scale / shift / gate 三组调制量。
         scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)  # [:, None, :]: 在序列维插入长度 1，便于广播到 [b, t, d]。
         normed_inputs = normed_inputs * (1 + scale) + shift  # pi0.5 在这里通过 cond 对 norm 后特征做条件化调制。
+        # 这里的 scale/shift 改变的是 action expert 对当前 denoising 时间的“理解方式”：
+        # t 靠近 1 时输入更像噪声，t 靠近 0 时输入更像真实动作，action expert 需要不同的处理策略。
+        # gate 则留到 residual 阶段，让模型控制当前 attention/FFN 更新量应该写入多少。
         return normed_inputs.astype(dtype), gate  # gate 会在残差连接阶段使用，不是这里立即乘上去。
 
 
@@ -146,11 +184,22 @@ class Embedder(nn.Module):
         )  # input_embedding_table: 共享词嵌入矩阵；这里只给第一个 expert 建立嵌入表。
 
     def encode(self, x):
+        # 输入:
+        # - x: token ids，形状通常是 [batch, token_len]。
+        # 输出:
+        # - token embeddings，形状 [batch, token_len, embed_dim]。
+        # 在 openpi 中，`pi0.py::embed_prefix()` 会通过 `self.PaliGemma.llm(..., method="embed")`
+        # 调到这里，把 prompt token ids 变成 prefix hidden states。
         x = self.input_embedding_table[(x,)]  # 根据 token id 查表，得到 [b, t, d] 嵌入。
         x *= jnp.sqrt(self.embed_dim).astype(x.dtype)  # 按常见 Transformer 做法乘 sqrt(d_model)，保持尺度一致。
         return x  # 返回离散 token 的连续表示。
 
     def decode(self, x):
+        # 输入:
+        # - x: hidden states，最后一维是 embed_dim。
+        # 输出:
+        # - logits，最后一维是 vocab_size。
+        # pi0/flow matching 主路径不依赖 decode，因为动作是通过 action_out_proj 输出，不是解码文本。
         return jnp.dot(x, self.input_embedding_table.T)  # 用 embedding matrix 转置做 tied decoding。
 
 
@@ -162,6 +211,32 @@ class Attention(nn.Module):
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
+        # 输入:
+        # - xs: list[hidden_states | None]。
+        #       xs[i] 是第 i 个 expert 的 token 表示，形状通常是 [batch, seq_len_i, width_i]。
+        #       在 openpi 当前主路径里：
+        #       xs[0] = prefix/PaliGemma tokens，xs[1] = suffix/action expert tokens。
+        # - positions: 所有本轮 query token 的 RoPE 位置，形状 [batch, total_query_len]。
+        #              如果本轮只跑 suffix，它就是 suffix positions；如果训练全量前向，就是 prefix+suffix positions。
+        # - attn_mask: attention 可见性 mask，形状 [batch, 1, query_len, key_len]。
+        #              它决定 suffix 能看 prefix，而 prefix 不反向看 suffix。
+        # - kv_cache: None 或之前 prefix 前向缓存下来的 (keys, values)。
+        #
+        # 输出:
+        # - out: list[hidden_states | None]，结构和 xs 对齐，每个 expert 拿回自己的 attention 输出。
+        # - (k, v): 更新后的 key/value，可作为下一步的 KV cache。
+        # xs 是一个 list，每个元素对应一个 expert 的 token hidden states：
+        # - xs[0]: PaliGemma expert 的 tokens，通常是图像 + prompt prefix。
+        # - xs[1]: action expert 的 tokens，通常是 state/action suffix 或 action suffix。
+        #
+        # 在 `compute_loss()` 训练时，pi0.py 会传入 [prefix_tokens, suffix_tokens]，
+        # 所以两个 expert 都参与前向。
+        #
+        # 在 `sample_actions()` 推理时有两种调用：
+        # - 先传 [prefix_tokens, None] 填好 prefix KV cache。
+        # - 后续每个 Euler step 传 [None, suffix_tokens]，并复用 prefix KV cache。
+        #
+        # 这就是为什么这里要支持 x is None，也为什么要返回新的 kv_cache。
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -172,10 +247,13 @@ class Attention(nn.Module):
 
         dtype = next(x.dtype for x in xs if x is not None)  # dtype: 拿第一个真实输入 expert 的 dtype 作为当前注意力计算的目标精度。
 
-        qkvs = []  # qkvs: 暂存每个 expert 各自算出来的 (q, k, v)，后面会在序列维拼接。
+        qkvs = []  # qkvs: list of tuples，每个元素是当前 expert 的 (q, k, v)。
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
                 continue  # x is None: 说明这一路 expert 这次不参与前向，比如 prefix-only / suffix-only 模式。
+            # 每个 expert 都有自己的 q/k/v 投影参数，参数名通过 `_name(..., i)` 区分。
+            # 第 0 个 expert 叫 q_einsum / kv_einsum，第 1 个 expert 叫 q_einsum_1 / kv_einsum_1。
+            # 这让 PaliGemma 权重能直接加载到第 0 个 expert，同时 action expert 拥有独立参数。
             if config.num_kv_heads == config.num_heads:
                 qkv_einsum = lora.Einsum(
                     shape=(3, config.num_heads, config.width, config.head_dim),
@@ -191,17 +269,20 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                     lora_config=config.lora_configs.get("attn"),
                 )  # q_einsum: 当 num_kv_heads < num_heads 时，query 单独投影，支持 GQA/MQA。
-                q = q_einsum("BTD,NDH->BTNH", x)
+                q = q_einsum("BTD,NDH->BTNH", x)  # q: 当前 expert 的 query，形状 [batch, token_len, num_heads, head_dim]。
                 kv_einsum = lora.Einsum(
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )  # kv_einsum: key/value 头数更少时，共享同一组 kv 头来服务多组 query 头。
-                k, v = kv_einsum("BSD,2KDH->2BSKH", x)
+                k, v = kv_einsum("BSD,2KDH->2BSKH", x)  # k/v: 当前 expert 的 key/value，形状 [batch, token_len, num_kv_heads, head_dim]。
                 qkvs.append((q, k, v))  # 最后无论哪条分支，都整理成 (q, k, v) 三元组。
 
-        q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))  # 在序列维拼接各 expert token，这样后面只做一次统一 attention。
+        q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))  # q/k/v: 把所有参与本轮前向的 expert 在 token 维拼成一条总序列。
+        # 拼接后的意义是：prefix tokens 和 suffix/action tokens 可以在同一个 attention 图里交互。
+        # 具体谁能看谁，不由拼接本身决定，而是由 `attn_mask` 决定。
+        # `pi0.py::make_attn_mask()` 会保证 prefix 不反向依赖 suffix，而 suffix 可以看 prefix。
 
         q = _apply_rope(q, positions=positions)  # q 使用 RoPE 注入位置信息。
         q *= self.configs[0].head_dim ** -0.5  # 缩放 query，避免点积随 head_dim 变大而数值过大。
@@ -215,9 +296,12 @@ class Attention(nn.Module):
             cache_k, cache_v = kv_cache  # kv_cache: 推理时 prefix 先跑过一次后缓存下来的 key/value。
             k = jnp.concatenate([cache_k, k], axis=1)  # 把旧缓存和这一步新 suffix 的 k 拼起来，形成完整上下文。
             v = jnp.concatenate([cache_v, v], axis=1)  # v 同理。
+            # 注意这里 cache 只缓存 K/V，不缓存 Q：
+            # 因为当前 suffix token 仍然需要产生新的 query 去“查询”prefix 和 suffix 上下文。
+            # prefix 的 K/V 固定不变，所以可以复用；suffix 的 K/V 每个 denoising step 都会随着 x_t 改变。
 
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)  # G: 表示“每个 kv 头服务多少个 query 头”。
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)  # 注意力分数先升到 float32，更稳。
+        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)  # logits: query 和 key 点积后的注意力分数，形状 [B, K, G, T, S]。
 
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
@@ -226,12 +310,12 @@ class Attention(nn.Module):
 
         # big_neg = jnp.finfo(logits.dtype).min
         big_neg = -2.3819763e38  # 用非常小的负数把不可见位置压到 softmax 后接近 0。
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)  # attn_mask 为 False 的地方全部屏蔽。
+        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)  # masked_logits: 把不可见 key 位置替换成极小值。
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)  # softmax 后再转回原始精度，节省显存。
+        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)  # probs: 每个 query 对所有 key 的注意力概率分布。
 
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)  # 用注意力权重对 value 做加权求和。
-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")  # 把分组头再并回标准多头表示。
+        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)  # encoded: 注意力聚合后的多头表示。
+        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")  # encoded: 头维合并后形状 [batch, query_len, num_heads, head_dim]。
 
         out = []  # out: 最后再把“合并后统一计算”的输出按 expert 序列长度切回去。
         start = 0  # start/end: 在拼接后的总序列里定位每个 expert 自己那一段。
@@ -248,6 +332,9 @@ class Attention(nn.Module):
                 start = end  # 下一个 expert 从后面继续切。
             else:
                 out.append(None)  # 保持返回结构与输入 xs 对齐。
+        # 返回 list 的形式非常关键：
+        # `pi0.py` 依赖 `(prefix_out, suffix_out)` 这种解包方式，
+        # 并且只会对 suffix_out 的最后 action_horizon 个 token 做 action_out_proj。
 
         return out, (k, v)  # 同时返回更新后的 kv，供推理缓存继续复用。
 
@@ -261,17 +348,22 @@ class FeedForward(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        # 输入:
+        # - x: 某个 expert 的 hidden states，形状 [batch, seq_len, features]。
+        # 输出:
+        # - outputs: FFN 更新量，形状仍然是 [batch, seq_len, features]。
+        # 注意：这里不负责残差相加，残差在 Block.__call__ 里统一处理。
         dtype = x.dtype  # dtype: 保持和外面 residual 一致，避免精度混乱。
         w_gating = self.param(
             "gating_einsum",
             nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
             (2, self.features, self.hidden_dim),
         ).astype(dtype)  # w_gating[0] 和 w_gating[1] 对应 gated-GELU FFN 的两条分支。
-        ff_gate = jnp.dot(x, w_gating[0])
-        gate_value = nn.gelu(ff_gate)  # 一条分支过非线性，提供门控。
+        ff_gate = jnp.dot(x, w_gating[0])  # ff_gate: 门控分支的线性投影，形状 [batch, seq_len, hidden_dim]。
+        gate_value = nn.gelu(ff_gate)  # gate_value: GELU 后的门控值。
 
-        ff1 = jnp.dot(x, w_gating[1])  # 另一条分支保持线性激活。
-        activations = gate_value * ff1  # 两条分支逐元素相乘，就是 Gemma/GLU 风格 FFN。
+        ff1 = jnp.dot(x, w_gating[1])  # ff1: 内容分支的线性投影，形状 [batch, seq_len, hidden_dim]。
+        activations = gate_value * ff1  # activations: 门控后的 FFN 中间激活。
 
         w_linear = self.param(
             "linear",
@@ -294,28 +386,51 @@ class Block(nn.Module):
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+        # 输入:
+        # - xs: list[hidden_states | None]，一个 expert 一份 token hidden states。
+        # - kv_cache: None 或历史 K/V 缓存，推理时用来让 suffix 读取 prefix。
+        # - positions: 当前 query tokens 的 RoPE 位置。
+        # - attn_mask: 当前 query tokens 对 key tokens 的可见性规则。
+        # - adarms_cond: list[condition | None]，和 xs/configs 对齐。
+        # - deterministic: 是否关闭 dropout；推理时通常为 True。
+        #
+        # 输出:
+        # - xs: list[hidden_states | None]，每个 expert 经过一层 Transformer block 后的结果。
+        # - kv_cache: 这一层更新后的 K/V 缓存。
+        # 一个 Block 就是一层 Transformer。
+        # 这里的特殊之处是：同一层同时处理多个 expert 的 token 流。
+        #
+        # 对 pi0 来说，adarms_cond 通常是 [None, None]：
+        # - prefix expert 普通 RMSNorm
+        # - action expert 普通 RMSNorm
+        #
+        # 对 pi0.5 来说，adarms_cond 通常是 [None, time_emb]：
+        # - prefix expert 不受 flow timestep 调制
+        # - action expert 通过 time_emb 做 adaptive RMSNorm
         xs = sharding.activation_sharding_constraint(xs)  # 给激活加 sharding 约束，帮助大模型并行训练。
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x  # 无 dropout 时退化成恒等函数。
 
-        attn = Attention(configs=self.configs, name="attn")  # 所有 expert 共享一套“统一 attention 计算框架”。
+        attn = Attention(configs=self.configs, name="attn")  # attn: 当前 block 内的 self-attention 子层。
 
-        pre_attn = []  # pre_attn: attention 前归一化后的输入。
-        gates = []  # gates: 只有 adaRMS 分支会返回 gate，普通 RMSNorm 返回 None。
+        pre_attn = []  # pre_attn: list，存 attention 前归一化后的 hidden states。
+        gates = []  # gates: list，存 attention 子层 residual 的门控值。
         for i, x in enumerate(xs):
             if x is not None:
                 x, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])  # noqa: PLW2901  # pi0.5 就是在这里把 timestep 条件打进 attention 前归一化。
             pre_attn.append(x)
             gates.append(gate if x is not None else None)
+        # 这里的 gate 如果来自 pi0.5 action expert，就会调节 attention 输出写回 residual 的强度。
+        # 直觉上，模型可以根据当前 flow 时间 t 决定“这一层 attention 更新要更激进还是更保守”。
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)  # 真正做 self-attention，并顺便更新 kv cache。
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)  # post_attn: 每个 expert 的 attention 更新量；kv_cache: 新的 K/V。
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)  # 训练时可选 dropout。
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]  # attention 残差；若有 gate，则变成条件门控残差。
         xs = sharding.activation_sharding_constraint(xs)
 
-        out = []  # out: FFN 分支的输出。
-        gates = []  # 重新收集 FFN 前归一化返回的 gate。
+        out = []  # out: list，存 FFN 子层输出。
+        gates = []  # gates: list，存 FFN 子层 residual 的门控值。
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901  # pi0.5 也会在 FFN 前归一化这里注入条件。
@@ -327,6 +442,8 @@ class Block(nn.Module):
                 )(x)  # FFN 同样支持 LoRA 版实现。
             out.append(x)
             gates.append(gate if x is not None else None)
+        # attention 和 FFN 前各做一次 RMSNorm，因此 pi0.5 的时间条件每层会注入两次：
+        # 一次影响 attention 子层，一次影响 FFN 子层。
 
         out = sharding.activation_sharding_constraint(out)
         out = jax.tree.map(lambda x: drop(x, deterministic), out)
@@ -351,6 +468,17 @@ class Module(nn.Module):
     adarms: bool = False  # adarms: 这里只是配置位，真正是否传 cond 由上层调用时的 adarms_cond 决定。
 
     def setup(self):
+        # 输入:
+        # - 无显式输入；setup 根据 self.configs / self.embed_dtype / dropout 配置创建参数化子模块。
+        # 输出:
+        # - 没有 return；副作用是注册 embedder、layers、final_norms 等子模块。
+        #
+        # 这个 setup 不是数据前向，而是 Flax Linen 的模块构造阶段。
+        # Module 是 `pi0.py` 中 `self.PaliGemma.llm` 的实际主体。
+        # 它要同时满足三种 openpi 调用方式：
+        # 1. `method="embed"`: 只把 prompt token id 查表成 prefix embeddings。
+        # 2. `[prefix_tokens, suffix_tokens]`: 训练时一次性跑完整上下文。
+        # 3. `[None, suffix_tokens] + kv_cache`: 推理采样时只跑 suffix，并读取缓存的 prefix K/V。
         # all experts must have the same depth
         assert all(config.depth == self.configs[0].depth for config in self.configs)
         # 多 expert 可以宽度不同，但 block 深度必须一样，
@@ -369,8 +497,8 @@ class Module(nn.Module):
         )  # remat: 对 block 做梯度检查点，节省训练显存。
         self.layers = nn.scan(
             block_cls,
-            variable_axes={"params": 0},
-            split_rngs={"params": True, "dropout": True},
+            variable_axes={"params": 0},  # params 这一维沿 layer 扫描展开：每层 block 有自己的一份参数。
+            split_rngs={"params": True, "dropout": True},  # 每层初始化参数和 dropout 都拿独立 rng，避免所有层参数相同。
             in_axes=(
                 0,
                 nn.broadcast,
@@ -388,6 +516,11 @@ class Module(nn.Module):
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
+        # 输入:
+        # - tokens: PaliGemma tokenizer 产生的 prompt token ids。
+        # 输出:
+        # - embeddings: 第一个 expert 的连续 token embeddings。
+        # 在 openpi 中，这个函数只负责 prefix 里的语言 token，不负责 action token。
         return self.embedder.encode(tokens).astype(self.embed_dtype)  # 把离散 token id 转成第一个 expert 的连续前缀表示。
 
     @at.typecheck
@@ -402,10 +535,40 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        # 输入:
+        # - embedded: list of expert inputs。
+        #   embedded[0] 属于 PaliGemma expert，宽度通常是 2048。
+        #   embedded[1] 属于 action expert，宽度通常是 1024。
+        # - positions: 当前输入 tokens 的位置索引。
+        # - mask: attention mask，进来时是 [batch, query_len, key_len]。
+        # - adarms_cond: 每个 expert 的 adaptive RMSNorm 条件。
+        # - kv_cache: 推理阶段可选，用于缓存 prefix 的 K/V。
+        # - deterministic: 控制 dropout。
+        #
+        # 输出:
+        # - embedded: list of outputs，结构和输入 list 对齐。
+        #   pi0.py 中通常解包成 `(prefix_out, suffix_out)`。
+        # - kv_cache: 全层 K/V 缓存，sample_actions 里会被后续 denoising step 复用。
+        # embedded 的 list 结构就是“哪个 expert 本轮有 token 要跑”：
+        #
+        # 训练:
+        #   embedded = [prefix_tokens, suffix_tokens]
+        #
+        # 推理填 cache:
+        #   embedded = [prefix_tokens, None]
+        #
+        # 推理 denoise step:
+        #   embedded = [None, suffix_tokens]
+        #
+        # 这种接口设计让 openpi 可以在训练时完整建图，在推理时复用 prefix cache。
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)  # 统一把输入 hidden states 转成主计算精度。
         mask = jnp.asarray(mask)[:, None, :, :]  # attention 实现期望 [b, 1, t, s] 形式的 mask，这里补一个单例 head 维。
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)  # 默认所有 expert 都走普通 RMSNorm 分支。
+        # adarms_cond 的 list 长度必须和 configs 对齐。
+        # 在 openpi 当前 pi0.5 主路径里，它通常是 [None, time_emb]：
+        # 第一个 None 表示 PaliGemma expert 不做 adaptive norm，
+        # 第二个 time_emb 表示 action expert 根据 flow timestep 调制。
 
         embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)  # 整栈 block 同步推进所有 expert 的 token 流。
 
@@ -417,6 +580,16 @@ class Module(nn.Module):
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
+        # 输入:
+        # - use_adarms: list[bool]，长度和 configs 一致，表示每个 expert 初始化时是否要走 adaptive RMSNorm 分支。
+        # 输出:
+        # - 无显式输出；副作用是让 Linen 创建所有可能需要的参数。
+        #
+        # 上游 `Pi0.__init__` 会在 pi0.5 时传 [False, True]：
+        # 第 0 个 PaliGemma expert 不需要 adaRMS；第 1 个 action expert 需要 adaRMS。
+        # Linen 是惰性创建参数的：某个分支如果没有跑过，对应参数就不会被创建。
+        # pi0.5 的 adaptive RMSNorm 只有在 cond 不为 None 时才会创建 Dense 参数，
+        # 所以 `pi0.py` 初始化时会传 use_adarms=[False, True]，强制 action expert 的 adaRMS 参数被建出来。
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))  # 先初始化 embedder 参数。
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
@@ -428,6 +601,19 @@ class Module(nn.Module):
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):
     """Applies RoPE positions [B, L] to x [B, L, H, D]."""
+    # 输入:
+    # - x: query 或 key 张量，形状类似 [batch, seq_len, heads, head_dim]。
+    # - positions: 每个 token 的位置 id，形状 [batch, seq_len]。
+    # - max_wavelength: RoPE 最大波长，控制最低频位置编码。
+    #
+    # 输出:
+    # - res: 和 x 同形状的旋转后 q/k。
+    #
+    # 它只作用于 q/k，不作用于 v，因为 RoPE 是通过旋转 query/key 来影响点积注意力分数。
+    # RoPE 这里服务的是“统一拼接后的 token 序列位置”。
+    # 在训练时，positions 来自 prefix+suffix 的整体 cumsum；
+    # 在推理 suffix-only 时，`pi0.py` 会用 prefix 长度作为 offset，让 suffix 位置接在 prefix 后面。
+    # 这样 suffix token 在读取 prefix KV cache 时，位置编码仍然和完整序列前向一致。
     freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)  # 为每一对偶数/奇数通道生成对应频率指数。
     timescale = max_wavelength**freq_exponents  # 得到从短波到长波的一组 RoPE 时间尺度。
     radians = positions[..., None] / timescale[None, None, :]  # 把离散位置 index 映射成每个频率下的转角。
@@ -446,6 +632,14 @@ def _apply_rope(x, *, positions, max_wavelength=10_000):
 
 
 def _name(name, i):
+    # 输入:
+    # - name: 原始参数/子模块名，例如 "attn"、"mlp"、"pre_attention_norm"。
+    # - i: expert index。
+    # 输出:
+    # - 第 0 个 expert 返回原名；后续 expert 返回带后缀的名字。
+    #
+    # 这个命名规则直接影响 checkpoint 参数路径，也是 JAX -> PyTorch 转换脚本能区分 PaliGemma
+    # 和 action expert 参数的基础。
     # we name layers like this because we want the first expert's weights to have no suffix (e.g., "attn"), so that they
     # can be loaded seamlessly from the existing PaliGemma checkpoint. subsequent experts will have a suffix (e.g.,
     # "attn_1") and their weights will be initialized from scratch. in practice, we only use two experts -- PaliGemma,
@@ -456,6 +650,15 @@ def _name(name, i):
 
 
 def _gated_residual(x, y, gate):
+    # 输入:
+    # - x: residual 主分支输入，形状 [batch, seq_len, width] 或 None。
+    # - y: attention/FFN 子层产生的更新量，形状与 x 一致或 None。
+    # - gate: adaptive RMSNorm 产生的门控，形状通常是 [batch, 1, width]，或 None。
+    # 输出:
+    # - 普通 residual 或 gated residual 后的 hidden states。
+    # 普通 Transformer residual 是 x + y。
+    # pi0.5 的 adaRMSNorm 会额外产生 gate，于是 residual 变成 x + gate * y。
+    # 这让 flow timestep 不只是影响 norm 后的特征，还能影响“这一层更新量写入多少”。
     assert (x is None) == (y is None)  # 输入和增量必须同时存在或同时缺失。
     if x is None:
         return None  # 当前 expert 本轮没参与前向，就保持 None。
