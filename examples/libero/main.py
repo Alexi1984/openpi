@@ -129,7 +129,7 @@ def eval_libero(args: Args) -> None:
 
             # Reset environment
             env.reset()  # reset: 先把环境清到初始状态，再单独用 set_init_state 注入 benchmark 提供的确定性初始状态。
-            action_plan = collections.deque()  # action_plan: 当前这轮 rollout 还没执行完的 action chunk 队列。
+            action_plan = collections.deque()  # action_plan: 当前这轮 rollout 还没执行完的 action chunk 队列。从服务端 policy 一次推理返回的 action chunk 中，当前准备依次执行的那几步动作。
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])  # obs: 设置完任务指定初始状态后返回的第一帧观测。
