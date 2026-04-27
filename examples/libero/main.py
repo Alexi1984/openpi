@@ -197,13 +197,22 @@ def eval_libero(args: Args) -> None:
                             "observation/wrist_image": wrist_img,
                             "observation/state": np.concatenate(
                                 (
+                                    # robot0_eef_pos: end effector position，机械臂末端执行器当前的三维位置 (x, y, z)。
+                                    # 它回答的是“手现在在空间里的哪里”。
                                     obs["robot0_eef_pos"],
+                                    # robot0_eef_quat: end effector quaternion，机械臂末端执行器当前的姿态朝向。
                                     # 训练侧的状态不是直接吃 quaternion，而是吃 axis-angle 形式的姿态表示。
                                     # 所以这里先把末端四元数转换成 3 维 axis-angle，再拼到 state 里。
+                                    # 这一段回答的是“手当前朝向是什么”。
                                     _quat2axisangle(obs["robot0_eef_quat"]),
+                                    # robot0_gripper_qpos: gripper joint position，夹爪当前的关节位置 / 开合状态。
+                                    # 这一段回答的是“夹爪现在张开了多少、闭合了多少”。
                                     obs["robot0_gripper_qpos"],
                                 )
                             ),
+                            # 这里把 position(3) + axis-angle(3) + gripper_qpos(通常 2) 拼成 observation/state。
+                            # 对 LIBERO 这条 openpi 输入链来说，这个 state 最终通常是 8 维，
+                            # 也和 src/openpi/policies/libero_policy.py 里的示例输入维度一致。
                             # prompt: 语言任务描述，会被服务端 policy 当作高层任务指令输入。
                             # 对 LIBERO 任务来说，这通常就是 task.language。
                             "prompt": str(task_description),
