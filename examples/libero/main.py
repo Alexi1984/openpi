@@ -24,7 +24,7 @@ LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 # 这里的环境渲染分辨率故意设成和训练数据生成时一致的 256。
 # 后面虽然还会 resize 到 224 发给模型，但先用训练时一致的 render resolution，
 # 可以尽量减少“训练图像分布”和“评测图像分布”的偏差。
-LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data  环境先渲染出 256 x 256 的原始图像
 
 
 @dataclasses.dataclass
