@@ -29,29 +29,36 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 @dataclasses.dataclass
 class Args:
+    # Args:
+    # 这个 dataclass 会被 tyro 自动解析成命令行参数集合。
+    # 也就是说，运行 `python examples/libero/main.py --help` 时能看到的那些 CLI 选项，
+    # 基本都来自这里。它本质上是“LIBERO 推理客户端的运行配置”。
+
     #################################################################################################################
     # Model server parameters
     #################################################################################################################
-    host: str = "0.0.0.0"
-    port: int = 8000
-    resize_size: int = 224
-    replan_steps: int = 5
+    host: str = "0.0.0.0"  # host: WebSocket 策略服务端地址。客户端会连到这里，把观测发给远端 policy。
+    port: int = 8000  # port: 对应 scripts/serve_policy.py 启动服务时监听的端口。
+    resize_size: int = 224  # resize_size: 推理前把图像缩放到多少分辨率；应与训练/策略输入期望保持一致。
+    replan_steps: int = 5  # replan_steps: 每次只执行 action chunk 的前多少步，然后重新感知并向服务端请求新计划。
 
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
+        # task_suite_name: 选择要评测的 LIBERO 任务集合。
+        # 不同 suite 的任务类型、难度和最长 rollout 长度都不同，后面的 max_steps 也会跟着切换。
         "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
-    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_steps_wait: int = 10  # num_steps_wait: reset 后先空转多少步，等待物体掉落 / 稳定，避免一开始就读到不稳定观测。
+    num_trials_per_task: int = 50  # num_trials_per_task: 每个任务做多少次 rollout，用来统计该任务的成功率。
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
+    video_out_path: str = "data/libero/videos"  # video_out_path: 每个 episode 的回放视频输出目录。
 
-    seed: int = 7  # Random Seed (for reproducibility)
+    seed: int = 7  # seed: 控制 numpy 和环境相关随机性，方便复现实验结果。
 
 
 def eval_libero(args: Args) -> None:
