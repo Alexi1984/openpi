@@ -705,6 +705,10 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )  # embedder 只给第一个 expert 用；后续 expert 一般直接接收外部已经构造好的连续 token。
+        # 这里先把单层 Transformer Block 包装成 rematerialized 版本。
+        # 训练时它会尽量少保存中间激活，需要反向传播时再重算一部分前向，从而节省显存。
+        # `deterministic` 被放进 static_argnums，表示把 dropout 的开关当成静态控制参数。
+        # 后面 `nn.scan` 堆整栈 Transformer 时，用的就是这个“省显存版”的 Block。
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
